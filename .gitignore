@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+data/**/*.csv
+data/**/*.xlsx
+outputs/figures/*.png
+.DS_Store
+__pycache__/
+.ipynb_checkpoints/
