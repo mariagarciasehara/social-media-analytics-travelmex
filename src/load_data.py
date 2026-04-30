@@ -1,6 +1,7 @@
+import io
 import pandas as pd
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 import warnings
 
 ContentType = Literal["posts", "reels", "stories", "videos", "unknown"]
@@ -25,11 +26,17 @@ def detect_content_type(df: pd.DataFrame) -> ContentType:
 
 
 def load_instagram_csv(
-        path: str | Path,
+        source: Union[str, Path, bytes, io.BytesIO],
         min_numeric_ratio: float = 0.6,
 ) -> pd.DataFrame:
     """
     Loads and cleans Instagram Insights CSV exports in a robust way.
+
+    Accepts:
+    - A file path (str or Path)
+    - Raw bytes
+    - A BytesIO buffer
+    - A Streamlit UploadedFile object
 
     Handles:
     - Headers located in different rows
@@ -38,24 +45,54 @@ def load_instagram_csv(
     - Smart numeric and date conversion
     - Automatic content type detection (Posts, Reels, Stories, etc.)
     """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
 
-    # Try common encodings (Instagram sometimes adds BOM)
-    for encoding in ["utf-8-sig", "utf-8", "latin1"]:
-        try:
-            sample = pd.read_csv(path, nrows=10, header=None, encoding=encoding)
-            break
-        except UnicodeDecodeError:
-            continue
+    # ── Normalise source to BytesIO ───────────────────────────────────────
+    if isinstance(source, (str, Path)):
+        path = Path(source)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        buffer = io.BytesIO(path.read_bytes())
+        source_name = path.name
+
+    elif isinstance(source, (bytes, bytearray)):
+        buffer = io.BytesIO(bytes(source))
+        source_name = "uploaded_file.csv"
+
+    elif isinstance(source, io.BytesIO):
+        source.seek(0)
+        buffer = source
+        source_name = "uploaded_file.csv"
+
+    elif hasattr(source, "read"):
+        # Streamlit UploadedFile or any file-like object
+        raw = source.read()
+        if hasattr(source, "seek"):
+            source.seek(0)
+        buffer = io.BytesIO(raw)
+        source_name = getattr(source, "name", "uploaded_file.csv")
+
     else:
-        raise ValueError("Could not read the file with common encodings")
+        raise TypeError(f"Unsupported source type: {type(source)}")
 
-    # Detect the real header row (the one with most keyword matches)
+    # ── Detect encoding ───────────────────────────────────────────────────
+    encoding_used = "utf-8"
+    for encoding in ["utf-8-sig", "utf-8", "latin1", "cp1252"]:
+        try:
+            buffer.seek(0)
+            pd.read_csv(buffer, nrows=2, encoding=encoding)
+            encoding_used = encoding
+            break
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
+
+    # ── Detect real header row ────────────────────────────────────────────
+    buffer.seek(0)
+    sample = pd.read_csv(buffer, nrows=10, header=None, encoding=encoding_used)
+
     header_row_idx = 0
     max_score = 0
-    keywords = ["id", "reach", "impressions", "likes", "comments", "date", "type", "posted", "published"]
+    keywords = ["id", "reach", "impressions", "likes", "comments",
+                "date", "type", "posted", "published", "saves", "shares"]
 
     for i in range(min(5, len(sample))):
         row = sample.iloc[i].astype(str)
@@ -64,17 +101,18 @@ def load_instagram_csv(
             max_score = score
             header_row_idx = i
 
-    # Load the full file skipping rows until the real header
+    # ── Load full file ────────────────────────────────────────────────────
+    buffer.seek(0)
     df_raw = pd.read_csv(
-        path,
+        buffer,
         skiprows=header_row_idx,
-        encoding=encoding,
+        encoding=encoding_used,
         dtype=str,
         low_memory=False,
         on_bad_lines="skip",
     )
 
-    # Clean column names
+    # ── Clean column names ────────────────────────────────────────────────
     df_raw.columns = (
         df_raw.columns
         .str.strip()
@@ -84,7 +122,7 @@ def load_instagram_csv(
         .str.replace(r"_+", "_", regex=True)
     )
 
-    # Rename duplicate columns
+    # ── Deduplicate columns ───────────────────────────────────────────────
     cols = pd.Series(df_raw.columns)
     for dup in df_raw.columns[df_raw.columns.duplicated(keep=False)]:
         count = sum(cols == dup)
@@ -96,41 +134,48 @@ def load_instagram_csv(
 
     df = df_raw.copy()
 
-    # Keep ID columns as strings
+    # ── Protect ID columns ────────────────────────────────────────────────
     id_cols = [c for c in df.columns if "id" in c.lower()]
     for col in id_cols:
         df[col] = df[col].astype(str).str.replace(r"\.0$", "", regex=True)
 
-    # Safe numeric conversion
+    # ── Safe numeric conversion ───────────────────────────────────────────
     for col in df.columns:
         if col in id_cols:
             continue
 
         serie = df[col].astype(str).str.strip()
 
-        # Clean common metric symbols (%, $, k, m)
         if serie.str.contains(r"[%,$kKmM]", regex=True).any():
             serie = serie.str.replace(r"[,%$]", "", regex=True)
-            serie = serie.str.replace(r"^(\d+\.?\d*)k$", lambda m: str(float(m.group(1)) * 1000), regex=True)
-            serie = serie.str.replace(r"^(\d+\.?\d*)m$", lambda m: str(float(m.group(1)) * 1000000), regex=True)
+            serie = serie.str.replace(
+                r"^(\d+\.?\d*)k$",
+                lambda m: str(float(m.group(1)) * 1000), regex=True
+            )
+            serie = serie.str.replace(
+                r"^(\d+\.?\d*)m$",
+                lambda m: str(float(m.group(1)) * 1_000_000), regex=True
+            )
 
         numeric = pd.to_numeric(serie, errors="coerce")
         if numeric.notna().mean() >= min_numeric_ratio:
             df[col] = numeric
 
-    # Final date conversion (silent, no warnings)
-    date_cols = [c for c in df.columns if any(k in c.lower() for k in ["date", "time", "posted", "published", "fecha"])]
+    # ── Date conversion ───────────────────────────────────────────────────
+    date_keywords = ["date", "time", "posted", "published", "fecha", "publish_time"]
+    date_cols = [c for c in df.columns if any(k in c.lower() for k in date_keywords)]
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for col in date_cols:
-            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)  # dayfirst=True for non-US accounts
+            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
 
-    # Final info
+    # ── Drop fully empty rows ─────────────────────────────────────────────
+    df.dropna(how="all", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
     content_type = detect_content_type(df)
-    print(f"File successfully loaded: {path.name}")
-    print(f"   Shape: {df.shape}")
-    print(f"   Detected content type: {content_type.upper()}")
+    print(f"✅ Loaded: {source_name}  |  {df.shape[0]} rows × {df.shape[1]} cols  |  {content_type.upper()}")
 
     return df
 
