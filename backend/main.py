@@ -1,15 +1,14 @@
-# backend/main.py — Travel Mex Tours | FastAPI Backend
+# backend/main.py — Travel Mex Tours | FastAPI Backend v2
 """
-REST API that exposes Instagram analytics as endpoints.
-Consumed by Streamlit frontend or any other client.
+REST API for Instagram analytics — updated with Performance Score as primary metric.
 
 Endpoints:
     GET  /health      → service health check
-    POST /upload      → upload CSV, get preview + metadata
-    POST /eda         → run EDA, get insights + stats
-    POST /hypothesis  → run statistical tests
-    POST /ml          → train models, get metrics + feature importance
-    POST /predict     → predict ER for a new post
+    POST /upload      → upload CSV, get preview + metadata including performance scores
+    POST /eda         → run EDA, returns Performance Score + ER insights
+    POST /hypothesis  → run statistical tests on both Score and ER
+    POST /ml          → train models predicting both Score and ER
+    POST /predict     → predict Score + ER for a new post with interpretation
 """
 import sys
 import io
@@ -34,9 +33,13 @@ from preprocessing import preprocess_df
 
 # ── App setup ──────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Travel Mex — Instagram Analytics API",
-    description="Data Science backend for Instagram performance analysis.",
-    version="1.0.0",
+    title="Travel Mex — Instagram Analytics API v2",
+    description=(
+        "Data Science backend for Instagram performance analysis. "
+        "Performance Score (0-100) is the primary metric — corrects for reach bias. "
+        "Formula: 40% ER + 40% Total Engagements + 20% Reach."
+    ),
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -49,9 +52,8 @@ app.add_middleware(
 )
 
 
-# ── Helper: make any value JSON-safe ──────────────────────────────────────
+# ── Helper: JSON-safe serialization ───────────────────────────────────────
 def _safe(obj: Any) -> Any:
-    """Recursively replace NaN/Inf/numpy types for JSON serialization."""
     if isinstance(obj, dict):
         return {k: _safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -68,21 +70,24 @@ def _safe(obj: Any) -> Any:
         return _safe(obj.tolist())
     if isinstance(obj, pd.Timestamp):
         return str(obj.date())
+    if isinstance(obj, pd.Categorical):
+        return str(obj)
     return obj
 
 
 # ── Pydantic model for /predict ────────────────────────────────────────────
 class PredictRequest(BaseModel):
-    reach:    Optional[float] = None
-    views:    Optional[float] = None
-    likes:    Optional[float] = None
-    comments: Optional[float] = None
-    saves:    Optional[float] = None
-    shares:   Optional[float] = None
-    follows:  Optional[float] = None
-    post_type: Optional[str]  = None
-    weekday:   Optional[str]  = None
-    hour:      Optional[int]  = None
+    reach:     Optional[float] = None
+    views:     Optional[float] = None
+    likes:     Optional[float] = None
+    comments:  Optional[float] = None
+    saves:     Optional[float] = None
+    shares:    Optional[float] = None
+    follows:   Optional[float] = None
+    post_type: Optional[str]   = None
+    weekday:   Optional[str]   = None
+    time_slot: Optional[str]   = None
+    month:     Optional[str]   = None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -92,8 +97,13 @@ class PredictRequest(BaseModel):
 # ── GET /health ────────────────────────────────────────────────────────────
 @app.get("/health", tags=["System"])
 def health():
-    """Quick health check — returns 200 if the API is running."""
-    return {"status": "ok", "service": "Travel Mex Analytics API", "version": "1.0.0"}
+    return {
+        "status":  "ok",
+        "service": "Travel Mex Analytics API",
+        "version": "2.0.0",
+        "primary_metric": "performance_score (0-100)",
+        "formula": "40% ER + 40% Total Engagements + 20% Reach"
+    }
 
 
 # ── POST /upload ───────────────────────────────────────────────────────────
@@ -101,7 +111,8 @@ def health():
 async def upload(file: UploadFile = File(...)):
     """
     Upload an Instagram CSV export.
-    Returns: shape, column names, metadata, and first 5 rows preview.
+    Returns shape, columns, full metadata including performance scores,
+    tier distribution, and first 5 rows preview.
     """
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
@@ -114,6 +125,8 @@ async def upload(file: UploadFile = File(...)):
         preview = df.head(5).copy()
         for col in preview.select_dtypes(include=["datetime64[ns]"]).columns:
             preview[col] = preview[col].astype(str)
+        for col in preview.select_dtypes(include=["category"]).columns:
+            preview[col] = preview[col].astype(str)
 
         return JSONResponse(_safe({
             "status":   "success",
@@ -121,7 +134,20 @@ async def upload(file: UploadFile = File(...)):
             "shape":    {"rows": len(df), "cols": len(df.columns)},
             "columns":  df.columns.tolist(),
             "meta":     meta,
-            "preview":  preview.to_dict(orient="records"),
+            "performance_summary": {
+                "avg_score":         meta.get("avg_performance_score"),
+                "high_performers":   meta.get("high_performers_count"),
+                "medium_performers": meta.get("medium_performers_count"),
+                "low_performers":    meta.get("low_performers_count"),
+                "above_avg":         meta.get("above_avg_count"),
+                "avg_relative":      meta.get("avg_count"),
+                "below_avg":         meta.get("below_avg_count"),
+                "interpretation": (
+                    f"Posts use on average {meta.get('avg_performance_score',0):.1f}% "
+                    "of the account's proven maximum potential."
+                )
+            },
+            "preview": preview.to_dict(orient="records"),
         }))
 
     except Exception as e:
@@ -132,61 +158,99 @@ async def upload(file: UploadFile = File(...)):
 @app.post("/eda", tags=["Analysis"])
 async def eda(file: UploadFile = File(...)):
     """
-    Run full Exploratory Data Analysis on the uploaded CSV.
-    Returns: summary stats, insights (best day, best hour, top content type),
-             engagement rate stats, and top 10 posts.
+    Run full EDA. Returns Performance Score stats, ER stats, best timing,
+    best content type, engagement breakdown, monthly trend, and top 10 posts.
+    Primary metric: Performance Score. Secondary: Engagement Rate.
     """
     try:
         raw      = await file.read()
         df_raw   = load_instagram_csv(io.BytesIO(raw))
         df, meta = preprocess_df(df_raw)
 
-        er_col   = meta["engagement_rate_col"]
-        type_col = meta.get("type_col")
-        er       = df[er_col].dropna()
+        er_col        = meta["engagement_rate_col"]
+        ps_col        = meta["performance_score_col"]
+        tier_col      = meta["performance_tier_col"]
+        tier_rel      = meta["performance_tier_relative_col"]
+        type_col      = meta.get("type_col")
+        time_slot_col = meta.get("time_slot_col")
+        date_col      = meta.get("date_col")
 
-        WEEKDAY_ORDER = ["Monday","Tuesday","Wednesday","Thursday","Friday",
-                         "Saturday","Sunday"]
+        WEEKDAY_ORDER = ["Monday","Tuesday","Wednesday","Thursday",
+                         "Friday","Saturday","Sunday"]
 
-        # ── Engagement rate stats ──────────────────────────────────────────
+        er = df[er_col].dropna()
+        ps = df[ps_col].dropna()
+
+        # ── Performance Score stats ────────────────────────────────────────
+        ps_stats = {
+            "mean":   round(ps.mean(), 2),
+            "median": round(ps.median(), 2),
+            "std":    round(ps.std(), 2),
+            "min":    round(ps.min(), 2),
+            "max":    round(ps.max(), 2),
+            "interpretation": (
+                f"Posts use on average {ps.mean():.1f}/100 of the account's proven potential. "
+                f"Best post reached {ps.max():.1f}/100."
+            )
+        }
+
+        # ── ER stats ──────────────────────────────────────────────────────
         er_stats = {
-            "mean":   round(er.mean(), 2),
-            "median": round(er.median(), 2),
-            "std":    round(er.std(), 2),
-            "min":    round(er.min(), 2),
-            "max":    round(er.max(), 2),
-            "q25":    round(er.quantile(0.25), 2),
-            "q75":    round(er.quantile(0.75), 2),
+            "mean":      round(er.mean(), 2),
+            "median":    round(er.median(), 2),
+            "std":       round(er.std(), 2),
+            "min":       round(er.min(), 2),
+            "max":       round(er.max(), 2),
+            "benchmark": 5.0,
+            "note":      "ER penalizes posts with higher reach — use Performance Score as primary metric."
         }
 
         # ── Best day ──────────────────────────────────────────────────────
-        best_day = None
-        day_avg  = {}
+        best_day_ps, best_day_er = None, None
+        day_avgs_ps, day_avgs_er = {}, {}
         if "weekday" in df.columns:
-            day_series = df.groupby("weekday")[er_col].mean()
-            day_avg    = {d: round(v, 2) for d, v in day_series.items()}
-            best_day   = day_series.idxmax()
+            day_ps = df.groupby("weekday")[ps_col].mean()
+            day_er = df.groupby("weekday")[er_col].mean()
+            day_avgs_ps = {d: round(v, 2) for d, v in day_ps.items()}
+            day_avgs_er = {d: round(v, 2) for d, v in day_er.items()}
+            best_day_ps = day_ps.idxmax()
+            best_day_er = day_er.idxmax()
 
-        # ── Best hour ─────────────────────────────────────────────────────
-        best_hour  = None
-        top3_hours = []
-        if "hour" in df.columns:
-            hour_series = df.groupby("hour")[er_col].mean()
-            best_hour   = int(hour_series.idxmax())
-            top3_hours  = [int(h) for h in hour_series.nlargest(3).index.tolist()]
+        # ── Best time slot ────────────────────────────────────────────────
+        best_slot_ps, slot_stats = None, {}
+        if time_slot_col and time_slot_col in df.columns:
+            slot_ps = df.groupby(time_slot_col, observed=True)[ps_col].mean()
+            slot_er = df.groupby(time_slot_col, observed=True)[er_col].mean()
+            slot_n  = df.groupby(time_slot_col, observed=True)[ps_col].count()
+            best_slot_ps = slot_ps.idxmax()
+            slot_stats = {
+                str(s): {
+                    "avg_score": round(float(slot_ps[s]), 2),
+                    "avg_er":    round(float(slot_er[s]), 2),
+                    "posts":     int(slot_n[s]),
+                    "reliable":  bool(slot_n[s] >= 10)
+                }
+                for s in slot_ps.index
+            }
 
         # ── Best content type ─────────────────────────────────────────────
-        best_type   = None
-        type_stats  = {}
+        best_type_ps, best_type_er, type_stats = None, None, {}
         if type_col and type_col in df.columns:
-            ts = df.groupby(type_col)[er_col].agg(["mean","median","count"])
+            ts = df.groupby(type_col).agg(
+                avg_score=(ps_col, "mean"),
+                avg_er=(er_col, "mean"),
+                posts=(er_col, "count")
+            ).round(2)
             type_stats = {
-                str(k): {"avg_er": round(v["mean"], 2),
-                         "median_er": round(v["median"], 2),
-                         "posts": int(v["count"])}
+                str(k): {
+                    "avg_score": float(v["avg_score"]),
+                    "avg_er":    float(v["avg_er"]),
+                    "posts":     int(v["posts"])
+                }
                 for k, v in ts.iterrows()
             }
-            best_type = ts["mean"].idxmax()
+            best_type_ps = ts["avg_score"].idxmax()
+            best_type_er = ts["avg_er"].idxmax()
 
         # ── Engagement breakdown ──────────────────────────────────────────
         breakdown = {}
@@ -198,39 +262,76 @@ async def eda(file: UploadFile = File(...)):
 
         # ── Monthly trend ─────────────────────────────────────────────────
         monthly_trend = []
-        date_col = meta.get("date_col")
         if date_col and pd.api.types.is_datetime64_any_dtype(df[date_col]):
-            monthly = df.set_index(date_col)[er_col].resample("ME").mean().dropna()
+            monthly_ps_s = df.set_index(date_col)[ps_col].resample("ME").mean().dropna()
+            monthly_er_s = df.set_index(date_col)[er_col].resample("ME").mean().dropna()
             monthly_trend = [
-                {"month": str(k.date()), "avg_er": round(v, 2)}
-                for k, v in monthly.items()
+                {
+                    "month":     str(k.date()),
+                    "avg_score": round(float(monthly_ps_s[k]), 2),
+                    "avg_er":    round(float(monthly_er_s.get(k, np.nan)), 2)
+                }
+                for k in monthly_ps_s.index
             ]
 
+        # ── Weekend check ─────────────────────────────────────────────────
+        weekend_info = {}
+        if "is_weekend" in df.columns:
+            weekend_n = int((df["is_weekend"]==True).sum())
+            weekend_info = {
+                "weekend_posts":     weekend_n,
+                "sufficient_data":   weekend_n >= 5,
+                "recommendation":    (
+                    "Weekend vs Weekday test available." if weekend_n >= 5
+                    else f"Only {weekend_n} weekend post(s). Need ≥5 to activate this analysis."
+                )
+            }
+
         # ── Top 10 posts ──────────────────────────────────────────────────
-        top10_cols = [c for c in [date_col, er_col, type_col,
-                                   meta.get("likes_col"), meta.get("saves_col")]
+        top10_cols = [c for c in [date_col, ps_col, er_col, tier_col, tier_rel,
+                                   type_col, meta.get("likes_col"), meta.get("saves_col")]
                       if c and c in df.columns]
-        top10 = df.nlargest(10, er_col)[top10_cols].copy()
+        top10 = df.nlargest(10, ps_col)[top10_cols].copy()
         if date_col in top10.columns:
             top10[date_col] = top10[date_col].astype(str)
+        for col in top10.select_dtypes(include=["category"]).columns:
+            top10[col] = top10[col].astype(str)
 
         return JSONResponse(_safe({
-            "status":          "success",
-            "total_posts":     len(df),
-            "date_range":      {"start": meta.get("date_range_start"),
-                                "end":   meta.get("date_range_end")},
-            "engagement_rate": er_stats,
-            "best_day":        best_day,
-            "day_averages":    day_avg,
-            "best_hour":       best_hour,
-            "top3_hours":      top3_hours,
-            "best_content_type": str(best_type) if best_type else None,
-            "content_type_stats": type_stats,
+            "status":        "success",
+            "total_posts":   len(df),
+            "date_range":    {
+                "start": meta.get("date_range_start"),
+                "end":   meta.get("date_range_end")
+            },
+            "performance_score": ps_stats,
+            "engagement_rate":   er_stats,
+            "tier_distribution": {
+                "vs_potential": {
+                    "High":   meta.get("high_performers_count"),
+                    "Medium": meta.get("medium_performers_count"),
+                    "Low":    meta.get("low_performers_count"),
+                },
+                "vs_peers": {
+                    "Above Average": meta.get("above_avg_count"),
+                    "Average":       meta.get("avg_count"),
+                    "Below Average": meta.get("below_avg_count"),
+                }
+            },
+            "best_day_by_score":    best_day_ps,
+            "best_day_by_er":       best_day_er,
+            "day_averages_score":   day_avgs_ps,
+            "day_averages_er":      day_avgs_er,
+            "best_slot_by_score":   str(best_slot_ps) if best_slot_ps else None,
+            "time_slot_stats":      slot_stats,
+            "best_type_by_score":   str(best_type_ps) if best_type_ps else None,
+            "best_type_by_er":      str(best_type_er) if best_type_er else None,
+            "content_type_stats":   type_stats,
             "engagement_breakdown": breakdown,
-            "monthly_trend":   monthly_trend,
-            "top10_posts":     top10.to_dict(orient="records"),
-            "benchmark":       5.0,
-            "beats_benchmark": bool(er.mean() > 5.0),
+            "monthly_trend":        monthly_trend,
+            "weekend_info":         weekend_info,
+            "top10_posts":          top10.to_dict(orient="records"),
+            "benchmark_er":         5.0,
         }))
 
     except Exception as e:
@@ -241,8 +342,8 @@ async def eda(file: UploadFile = File(...)):
 @app.post("/hypothesis", tags=["Analysis"])
 async def hypothesis(file: UploadFile = File(...)):
     """
-    Run hypothesis tests on the uploaded CSV.
-    Tests: content type vs ER (ANOVA), weekend vs weekday (t-test).
+    Run hypothesis tests on both Performance Score and Engagement Rate.
+    Tests: content type (ANOVA), time slot (ANOVA), weekend vs weekday (t-test).
     """
     from scipy import stats as scipy_stats
 
@@ -251,10 +352,13 @@ async def hypothesis(file: UploadFile = File(...)):
         df_raw   = load_instagram_csv(io.BytesIO(raw))
         df, meta = preprocess_df(df_raw)
 
-        er_col   = meta["engagement_rate_col"]
-        type_col = meta.get("type_col")
-        ALPHA    = 0.05
-        results  = {}
+        er_col        = meta["engagement_rate_col"]
+        ps_col        = meta["performance_score_col"]
+        type_col      = meta.get("type_col")
+        time_slot_col = meta.get("time_slot_col")
+        ALPHA         = 0.05
+
+        results = {}
 
         def eta2(groups):
             all_d = np.concatenate(groups)
@@ -268,65 +372,106 @@ async def hypothesis(file: UploadFile = File(...)):
             if e < 0.14: return "medium"
             return "large"
 
-        # Test 1: Content type vs ER
-        if type_col and type_col in df.columns:
-            groups = {
-                name: grp[er_col].dropna().values
-                for name, grp in df.groupby(type_col)
-                if len(grp[er_col].dropna()) >= 5
+        def run_test(groups_dict, alpha=ALPHA):
+            groups = list(groups_dict.values())
+            names  = list(groups_dict.keys())
+            if len(groups) == 2:
+                stat, p   = scipy_stats.ttest_ind(groups[0], groups[1], equal_var=False)
+                test_name = "Welch t-test"
+            else:
+                stat, p   = scipy_stats.f_oneway(*groups)
+                test_name = "One-Way ANOVA"
+            e2     = eta2(groups)
+            reject = p < alpha
+            best   = str(names[int(np.argmax([g.mean() for g in groups]))])
+            return {
+                "test":         test_name,
+                "statistic":    round(float(stat), 4),
+                "p_value":      round(float(p), 4),
+                "reject_H0":    reject,
+                "effect_size":  e2,
+                "effect_label": effect_label(e2),
+                "best_group":   best,
+                "group_means":  {str(n): round(float(g.mean()), 4)
+                                  for n, g in zip(names, groups)},
+                "significant":  reject,
             }
-            if len(groups) >= 2:
-                f, p   = scipy_stats.f_oneway(*groups.values())
-                e2     = eta2(list(groups.values()))
-                reject = bool(p < ALPHA)
-                best   = max(groups, key=lambda x: groups[x].mean())
-                results["test_content_type"] = {
-                    "question":    "Does content type significantly affect Engagement Rate?",
-                    "test":        "One-Way ANOVA",
-                    "statistic":   round(float(f), 4),
-                    "p_value":     round(float(p), 4),
-                    "reject_H0":   reject,
-                    "effect_size": e2,
-                    "effect_label": effect_label(e2),
-                    "best_type":   str(best),
-                    "group_means": {str(k): round(float(v.mean()), 2)
-                                    for k, v in groups.items()},
-                    "interpretation": (
-                        f"Content type {'DOES' if reject else 'does NOT'} "
-                        f"significantly affect ER (p={round(float(p),4)}, "
-                        f"effect={effect_label(e2)}). Best: {best}."
+
+        # Test 1: Content Type
+        if type_col and type_col in df.columns:
+            groups_ps = {name: grp[ps_col].dropna().values
+                         for name, grp in df.groupby(type_col)
+                         if len(grp[ps_col].dropna()) >= 5}
+            groups_er = {name: grp[er_col].dropna().values
+                         for name, grp in df.groupby(type_col)
+                         if len(grp[er_col].dropna()) >= 5}
+
+            if len(groups_ps) >= 2:
+                r_ps = run_test(groups_ps)
+                r_er = run_test(groups_er)
+                results["content_type"] = {
+                    "question":          "Does content type significantly affect performance?",
+                    "by_performance_score": r_ps,
+                    "by_engagement_rate":   r_er,
+                    "metrics_agree":     r_ps["best_group"] == r_er["best_group"],
+                    "recommendation": (
+                        f"Both metrics agree: prioritize {r_ps['best_group']}."
+                        if r_ps["best_group"] == r_er["best_group"]
+                        else f"Metrics differ. Score → {r_ps['best_group']} | ER → {r_er['best_group']}. "
+                             f"Use Performance Score as primary: prioritize {r_ps['best_group']}."
                     )
                 }
 
-        # Test 2: Weekend vs Weekday
+        # Test 2: Time Slot
+        if time_slot_col and time_slot_col in df.columns:
+            slot_groups_ps = {str(name): grp[ps_col].dropna().values
+                              for name, grp in df.groupby(time_slot_col, observed=True)
+                              if len(grp[ps_col].dropna()) >= 5}
+            if len(slot_groups_ps) >= 2:
+                r_slot = run_test(slot_groups_ps)
+                results["time_slot"] = {
+                    "question":             "Does time slot significantly affect Performance Score?",
+                    "by_performance_score": r_slot,
+                    "statistical_note":     "Early Morning has ~89 posts vs ~16 in other slots. Results are directional.",
+                    "recommendation": (
+                        f"Best slot: {r_slot['best_group']}. "
+                        "Run experiment posting 10x in Late Morning and Afternoon to confirm."
+                    )
+                }
+
+        # Test 3: Weekend vs Weekday
         if "is_weekend" in df.columns:
-            weekend = df[df["is_weekend"]==True][er_col].dropna().values
-            weekday = df[df["is_weekend"]==False][er_col].dropna().values
-            if len(weekend) >= 5 and len(weekday) >= 5:
-                t, p   = scipy_stats.ttest_ind(weekend, weekday, equal_var=False)
-                e2     = eta2([weekend, weekday])
-                reject = bool(p < ALPHA)
-                better = "Weekend" if weekend.mean() > weekday.mean() else "Weekday"
-                results["test_weekend"] = {
-                    "question":    "Do weekend posts outperform weekday posts?",
-                    "test":        "Welch t-test",
-                    "statistic":   round(float(t), 4),
-                    "p_value":     round(float(p), 4),
-                    "reject_H0":   reject,
-                    "effect_size": e2,
-                    "effect_label": effect_label(e2),
-                    "better_period": better,
-                    "weekday_avg": round(float(weekday.mean()), 2),
-                    "weekend_avg": round(float(weekend.mean()), 2),
-                    "interpretation": (
-                        f"{better} posts perform {'significantly' if reject else 'slightly'} "
-                        f"better (p={round(float(p),4)}, effect={effect_label(e2)}). "
-                        f"Weekday avg: {round(float(weekday.mean()),2)}% | "
-                        f"Weekend avg: {round(float(weekend.mean()),2)}%."
+            weekend_ps = df[df["is_weekend"]==True][ps_col].dropna().values
+            weekday_ps = df[df["is_weekend"]==False][ps_col].dropna().values
+            weekend_er = df[df["is_weekend"]==True][er_col].dropna().values
+            weekday_er = df[df["is_weekend"]==False][er_col].dropna().values
+
+            if len(weekend_ps) < 5:
+                results["weekend"] = {
+                    "status":          "insufficient_data",
+                    "weekend_posts":   int(len(weekend_ps)),
+                    "minimum_needed":  5,
+                    "recommendation":  (
+                        f"Only {len(weekend_ps)} weekend post(s). "
+                        "Post on weekends for 2-3 months to activate this test."
                     )
                 }
+            else:
+                r_ps = run_test({"Weekday": weekday_ps, "Weekend": weekend_ps})
+                r_er = run_test({"Weekday": weekday_er, "Weekend": weekend_er})
+                results["weekend"] = {
+                    "question":             "Do weekend posts outperform weekday posts?",
+                    "by_performance_score": r_ps,
+                    "by_engagement_rate":   r_er,
+                    "weekday_avg_score":    round(float(weekday_ps.mean()), 2),
+                    "weekend_avg_score":    round(float(weekend_ps.mean()), 2),
+                }
 
-        return JSONResponse(_safe({"status": "success", "alpha": ALPHA, "results": results}))
+        return JSONResponse(_safe({
+            "status":  "success",
+            "alpha":   ALPHA,
+            "results": results
+        }))
 
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -336,8 +481,8 @@ async def hypothesis(file: UploadFile = File(...)):
 @app.post("/ml", tags=["Machine Learning"])
 async def ml(file: UploadFile = File(...)):
     """
-    Train and compare ML models to predict Engagement Rate.
-    Returns: model metrics, best model, feature importance, summary.
+    Train ML models predicting both Performance Score (primary) and ER (secondary).
+    Returns model metrics, feature importance for both targets, and summary.
     """
     from sklearn.model_selection import train_test_split, KFold, cross_val_score
     from sklearn.preprocessing import StandardScaler, OneHotEncoder
@@ -352,29 +497,34 @@ async def ml(file: UploadFile = File(...)):
         df_raw   = load_instagram_csv(io.BytesIO(raw))
         df, meta = preprocess_df(df_raw)
 
-        er_col   = meta["engagement_rate_col"]
-        type_col = meta.get("type_col")
+        er_col        = meta["engagement_rate_col"]
+        ps_col        = meta["performance_score_col"]
+        type_col      = meta.get("type_col")
+        time_slot_col = meta.get("time_slot_col")
 
-        # Feature selection
         num_keys  = ["reach_col","views_col","likes_col","comments_col",
                      "saves_col","shares_col","follows_col"]
         num_feats = [meta[k] for k in num_keys if meta.get(k) and meta[k] in df.columns]
         cat_feats = []
-        if type_col and type_col in df.columns: cat_feats.append(type_col)
-        if "weekday" in df.columns: cat_feats.append("weekday")
-        if "hour"    in df.columns: cat_feats.append("hour")
+        if type_col and type_col in df.columns:            cat_feats.append(type_col)
+        if "weekday" in df.columns:                        cat_feats.append("weekday")
+        if time_slot_col and time_slot_col in df.columns:  cat_feats.append(time_slot_col)
 
         all_feats = num_feats + cat_feats
-        mdf       = df[all_feats + [er_col]].dropna()
+        mdf       = df[all_feats + [ps_col, er_col]].dropna()
 
         if len(mdf) < 30:
             raise HTTPException(status_code=422,
                 detail=f"Only {len(mdf)} complete rows — need ≥30.")
 
-        X = mdf[all_feats]
-        y = mdf[er_col]
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42)
+        X    = mdf[all_feats]
+        y_ps = mdf[ps_col]
+        y_er = mdf[er_col]
+
+        X_train, X_test, y_train_ps, y_test_ps = train_test_split(
+            X, y_ps, test_size=0.2, random_state=42)
+        _, _, y_train_er, y_test_er = train_test_split(
+            X, y_er, test_size=0.2, random_state=42)
 
         transformers = [("num", StandardScaler(), num_feats)]
         if cat_feats:
@@ -395,65 +545,91 @@ async def ml(file: UploadFile = File(...)):
                 subsample=0.8, random_state=42),
         }
 
-        results   = {}
-        pipelines = {}
+        def train_all(X, X_train, X_test, y_train, y_test, y_full):
+            results, pipes = {}, {}
+            for name, model in model_zoo.items():
+                pipe = Pipeline([("pre", pre), ("model", model)])
+                pipe.fit(X_train, y_train)
+                y_pred    = pipe.predict(X_test)
+                cv_scores = cross_val_score(pipe, X, y_full, cv=cv,
+                                            scoring="r2", n_jobs=-1)
+                results[name] = {
+                    "R2":        round(float(r2_score(y_test, y_pred)), 4),
+                    "MAE":       round(float(mean_absolute_error(y_test, y_pred)), 4),
+                    "RMSE":      round(float(np.sqrt(mean_squared_error(y_test, y_pred))), 4),
+                    "CV_R2":     round(float(cv_scores.mean()), 4),
+                    "CV_R2_std": round(float(cv_scores.std()), 4),
+                }
+                pipes[name] = pipe
+            best = max(results, key=lambda x: results[x]["R2"])
+            return results, pipes, best
 
-        for name, model in model_zoo.items():
-            pipe = Pipeline([("pre", pre), ("model", model)])
-            pipe.fit(X_train, y_train)
-            y_pred = pipe.predict(X_test)
+        results_ps, pipes_ps, best_ps = train_all(
+            X, X_train, X_test, y_train_ps, y_test_ps, y_ps)
+        results_er, pipes_er, best_er = train_all(
+            X, X_train, X_test, y_train_er, y_test_er, y_er)
 
-            cv_scores = cross_val_score(pipe, X, y, cv=cv, scoring="r2", n_jobs=-1)
-            results[name] = {
-                "R2":          round(float(r2_score(y_test, y_pred)), 4),
-                "MAE":         round(float(mean_absolute_error(y_test, y_pred)), 4),
-                "RMSE":        round(float(np.sqrt(mean_squared_error(y_test, y_pred))), 4),
-                "CV_R2_mean":  round(float(cv_scores.mean()), 4),
-                "CV_R2_std":   round(float(cv_scores.std()), 4),
-            }
-            pipelines[name] = pipe
-
-        best_model = max(results, key=lambda x: results[x]["R2"])
-
-        # Feature importance
-        feature_importance = []
-        for fname in ["Gradient Boosting", "Random Forest"]:
-            if fname in pipelines:
-                pipe     = pipelines[fname]
-                fitted   = pipe.named_steps["pre"]
-                num_names = num_feats.copy()
+        def get_fi(pipes, best):
+            for name in [best, "Gradient Boosting", "Random Forest"]:
+                if name not in pipes: continue
+                pipe   = pipes[name]
+                fitted = pipe.named_steps["pre"]
                 try:
                     ohe       = fitted.named_transformers_["cat"]
                     cat_names = ohe.get_feature_names_out(cat_feats).tolist()
                 except Exception:
                     cat_names = []
-                all_names   = num_names + cat_names
+                all_names   = num_feats + cat_names
                 importances = pipe.named_steps["model"].feature_importances_
                 if len(importances) == len(all_names):
-                    feature_importance = sorted(
+                    fi = sorted(
                         [{"feature": n, "importance": round(float(i), 4)}
                          for n, i in zip(all_names, importances)],
                         key=lambda x: -x["importance"]
                     )
-                break
+                    return fi[:10]
+            return []
 
-        bm        = results[best_model]
-        top_feat  = feature_importance[0]["feature"] if feature_importance else "N/A"
-        summary   = (
-            f"Best model: {best_model} "
-            f"(R²={bm['R2']}, MAE=±{bm['MAE']}%, CV R²={bm['CV_R2_mean']}±{bm['CV_R2_std']}). "
-            f"Top engagement driver: {top_feat}."
-        )
+        fi_ps = get_fi(pipes_ps, best_ps)
+        fi_er = get_fi(pipes_er, best_er)
+
+        bm_ps    = results_ps[best_ps]
+        bm_er    = results_er[best_er]
+        top_ps   = fi_ps[0]["feature"] if fi_ps else "N/A"
+        top_er   = fi_er[0]["feature"] if fi_er else "N/A"
 
         return JSONResponse(_safe({
-            "status":             "success",
-            "total_posts_used":   len(mdf),
-            "model_results":      results,
-            "best_model":         best_model,
-            "feature_importance": feature_importance[:10],
-            "numeric_features":   num_feats,
-            "categorical_features": cat_feats,
-            "summary":            summary,
+            "status":            "success",
+            "total_posts_used":  len(mdf),
+            "primary_target":    ps_col,
+            "secondary_target":  er_col,
+            "performance_score_models": {
+                "results":            results_ps,
+                "best_model":         best_ps,
+                "feature_importance": fi_ps,
+                "summary": (
+                    f"Best: {best_ps} (R²={bm_ps['R2']}, "
+                    f"MAE=±{bm_ps['MAE']} pts, CV R²={bm_ps['CV_R2']}). "
+                    f"Top driver: {top_ps}."
+                )
+            },
+            "engagement_rate_models": {
+                "results":            results_er,
+                "best_model":         best_er,
+                "feature_importance": fi_er,
+                "summary": (
+                    f"Best: {best_er} (R²={bm_er['R2']}, "
+                    f"MAE=±{bm_er['MAE']}%, CV R²={bm_er['CV_R2']}). "
+                    f"Top driver: {top_er}."
+                )
+            },
+            "drivers_agree":  top_ps == top_er,
+            "recommendation": (
+                f"Both targets share top driver: {top_ps}. Optimize this metric."
+                if top_ps == top_er
+                else f"Score driver: {top_ps} | ER driver: {top_er}. "
+                     f"Optimizing for ER alone may not maximize overall impact."
+            )
         }))
 
     except HTTPException:
@@ -466,8 +642,8 @@ async def ml(file: UploadFile = File(...)):
 @app.post("/predict", tags=["Machine Learning"])
 async def predict(request: PredictRequest, file: UploadFile = File(...)):
     """
-    Train model on uploaded data, then predict ER for a new post.
-    Send the CSV as a file + post details as JSON body.
+    Train models on uploaded data, then predict both Performance Score and ER
+    for a new post. Returns scores, interpretation, and actionable recommendation.
     """
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler, OneHotEncoder
@@ -479,19 +655,21 @@ async def predict(request: PredictRequest, file: UploadFile = File(...)):
         df_raw   = load_instagram_csv(io.BytesIO(raw))
         df, meta = preprocess_df(df_raw)
 
-        er_col   = meta["engagement_rate_col"]
-        type_col = meta.get("type_col")
+        er_col        = meta["engagement_rate_col"]
+        ps_col        = meta["performance_score_col"]
+        type_col      = meta.get("type_col")
+        time_slot_col = meta.get("time_slot_col")
 
         num_keys  = ["reach_col","views_col","likes_col","comments_col",
                      "saves_col","shares_col","follows_col"]
         num_feats = [meta[k] for k in num_keys if meta.get(k) and meta[k] in df.columns]
         cat_feats = []
-        if type_col and type_col in df.columns: cat_feats.append(type_col)
-        if "weekday" in df.columns: cat_feats.append("weekday")
-        if "hour"    in df.columns: cat_feats.append("hour")
+        if type_col and type_col in df.columns:            cat_feats.append(type_col)
+        if "weekday" in df.columns:                        cat_feats.append("weekday")
+        if time_slot_col and time_slot_col in df.columns:  cat_feats.append(time_slot_col)
 
         all_feats = num_feats + cat_feats
-        mdf       = df[all_feats + [er_col]].dropna()
+        mdf       = df[all_feats + [ps_col, er_col]].dropna()
 
         if len(mdf) < 20:
             raise HTTPException(status_code=422, detail="Not enough data to train model.")
@@ -501,49 +679,74 @@ async def predict(request: PredictRequest, file: UploadFile = File(...)):
             transformers.append(
                 ("cat", OneHotEncoder(drop="first", handle_unknown="ignore",
                                       sparse_output=False), cat_feats))
+        pre    = ColumnTransformer(transformers, remainder="drop")
+        params = dict(n_estimators=300, max_depth=5, learning_rate=0.05, random_state=42)
 
-        pipe = Pipeline([
-            ("pre", ColumnTransformer(transformers, remainder="drop")),
-            ("model", GradientBoostingRegressor(
-                n_estimators=300, max_depth=5, learning_rate=0.05, random_state=42))
-        ])
-        pipe.fit(mdf[all_feats], mdf[er_col])
+        pipe_ps = Pipeline([("pre", pre), ("model", GradientBoostingRegressor(**params))])
+        pipe_ps.fit(mdf[all_feats], mdf[ps_col])
 
-        # Build input from request
+        pipe_er = Pipeline([("pre", pre), ("model", GradientBoostingRegressor(**params))])
+        pipe_er.fit(mdf[all_feats], mdf[er_col])
+
+        # Build input
         col_map = {
-            "reach": meta.get("reach_col"), "views": meta.get("views_col"),
-            "likes": meta.get("likes_col"), "comments": meta.get("comments_col"),
-            "saves": meta.get("saves_col"), "shares": meta.get("shares_col"),
-            "follows": meta.get("follows_col"),
+            "reach":    meta.get("reach_col"),
+            "views":    meta.get("views_col"),
+            "likes":    meta.get("likes_col"),
+            "comments": meta.get("comments_col"),
+            "saves":    meta.get("saves_col"),
+            "shares":   meta.get("shares_col"),
+            "follows":  meta.get("follows_col"),
         }
         new_post = {}
         for req_key, col_name in col_map.items():
             if col_name and col_name in all_feats:
                 val = getattr(request, req_key, None)
-                new_post[col_name] = val if val is not None else df[col_name].median()
+                new_post[col_name] = val if val is not None else float(df[col_name].median())
 
         if type_col and type_col in cat_feats:
-            new_post[type_col] = request.post_type or df[type_col].mode()[0]
+            new_post[type_col] = request.post_type or str(df[type_col].mode()[0])
         if "weekday" in cat_feats:
             new_post["weekday"] = request.weekday or "Tuesday"
-        if "hour" in cat_feats:
-            new_post["hour"] = request.hour if request.hour is not None else 9
+        if time_slot_col and time_slot_col in cat_feats:
+            new_post[time_slot_col] = (
+                request.time_slot or
+                str(df.groupby(time_slot_col, observed=True)[ps_col].mean().idxmax())
+            )
 
-        prediction = float(max(0, pipe.predict(pd.DataFrame([new_post]))[0]))
-        avg_er     = float(df[er_col].mean())
+        pred_ps  = float(max(0, pipe_ps.predict(pd.DataFrame([new_post]))[0]))
+        pred_er  = float(max(0, pipe_er.predict(pd.DataFrame([new_post]))[0]))
+        avg_ps   = float(df[ps_col].mean())
+        avg_er   = float(df[er_col].mean())
+
+        # Interpretation
+        high_ps = pred_ps >= avg_ps
+        high_er = pred_er >= avg_er
+        if high_ps and high_er:
+            scenario = "strong_post"
+            recommendation = "Publish and consider boosting to maximize reach!"
+        elif high_ps and not high_er:
+            scenario = "good_reach"
+            recommendation = "Good absolute impact — add a strong CTA to drive more interactions."
+        elif not high_ps and high_er:
+            scenario = "good_engagement"
+            recommendation = "Good engagement quality but limited reach — consider boosting."
+        else:
+            scenario = "below_average"
+            recommendation = "Review content type, timing, or caption before publishing."
 
         return JSONResponse(_safe({
-            "status":          "success",
-            "predicted_er":    round(prediction, 2),
-            "your_avg_er":     round(avg_er, 2),
-            "benchmark":       5.0,
-            "above_avg":       prediction >= avg_er,
-            "above_benchmark": prediction >= 5.0,
-            "recommendation":  (
-                "Strong post — consider boosting to maximize reach!"
-                if prediction >= avg_er
-                else "Consider adjusting content type or posting time."
-            )
+            "status":            "success",
+            "predicted_score":   round(pred_ps, 2),
+            "predicted_er":      round(pred_er, 2),
+            "your_avg_score":    round(avg_ps, 2),
+            "your_avg_er":       round(avg_er, 2),
+            "benchmark_er":      5.0,
+            "above_avg_score":   high_ps,
+            "above_avg_er":      high_er,
+            "above_benchmark_er": pred_er >= 5.0,
+            "scenario":          scenario,
+            "recommendation":    recommendation,
         }))
 
     except HTTPException:
