@@ -69,6 +69,11 @@ def preprocess_df(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     type_col        = find_column(["post_type", "media_type", "type", "tipo"])
     duration_col    = find_column(["duration_sec", "duration", "video_duration", "length"])
 
+    # Clean invalid post type values in the raw data
+    if type_col and type_col in df.columns:
+        invalid_types = ["Post type", "post type", "Post Type"]
+        df[type_col] = df[type_col].replace(invalid_types, np.nan)
+
     # -------------------------------------------------------------------
     # 3. Numeric conversion
     # -------------------------------------------------------------------
