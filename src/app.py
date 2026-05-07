@@ -578,9 +578,16 @@ with tab_predictor:
         type_col_= _meta.get("type_col")
         ts_col_  = _meta.get("time_slot_col")
 
-        num_keys = ["reach_col","views_col","likes_col","comments_col",
-                    "saves_col","shares_col","follows_col"]
-        num_f = [_meta[k] for k in num_keys if _meta.get(k) and _meta[k] in _df.columns]
+        # Only include features with enough variation
+        # Excluded: saves (82% zeros), comments (93% zeros),
+        #           shares (74% zeros), follows (99% zeros)
+        # Defaults: reach=median(31), views=median(84), likes=mode(4)
+        INCLUDE_COLS = {
+            _meta.get("reach_col"): 31,   # median — mode only 6.5% of posts
+            _meta.get("views_col"): 84,   # median — mode only 4.1% of posts
+            _meta.get("likes_col"):  4,   # mode   — 24.4% representative
+        }
+        num_f = [col for col in INCLUDE_COLS if col and col in _df.columns]
         cat_f = []
         if type_col_ and type_col_ in _df.columns: cat_f.append(type_col_)
         if "weekday" in _df.columns:               cat_f.append("weekday")
@@ -618,13 +625,19 @@ with tab_predictor:
             st.markdown('<div class="section-title">Post Details</div>', unsafe_allow_html=True)
             new_post = {}
 
+            # Default values based on historical data analysis
+            DEFAULTS = {
+                meta.get("reach_col"): (31, "median — most representative"),
+                meta.get("views_col"): (84, "median — most representative"),
+                meta.get("likes_col"): ( 4, "mode   — 24.4% of posts"),
+            }
             for col_name in num_feats:
-                label   = col_name.replace("_"," ").title()
-                med_val = int(df[col_name].median()) if col_name in df.columns else 0
+                label      = col_name.replace("_"," ").title()
+                default_v, default_note = DEFAULTS.get(col_name, (0, ""))
                 new_post[col_name] = st.number_input(
                     f"Expected {label}",
-                    min_value=0, value=med_val, step=1,
-                    help=f"Your historical median: {med_val}"
+                    min_value=0, value=default_v, step=1,
+                    help=f"Default: {default_v} ({default_note})"
                 )
 
             if type_col and type_col in cat_feats:
